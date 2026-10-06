@@ -1,12 +1,20 @@
 """
-STICC_DETECTIVE - Telegram file-scanner bot (VirusTotal-powered), English + Khmer.
+STICC_DETECTIVE - Telegram file/link scanner bot (VirusTotal), English + Khmer.
+Short reports + "More info" button, and Auto Protection for groups and
+Telegram Business chats (silent unless something is dangerous).
+
+Optional env vars:
+  MAX_FILE_MB  max file size in MB (default 20; above 20 needs BOT_API_URL)
+  BOT_API_URL  address of a self-hosted Telegram Bot API server
 
 Install:  pip install python-telegram-bot httpx
 Env vars: TELEGRAM_TOKEN (from @BotFather), VT_API_KEY (from virustotal.com)
 Run:      python scanner_bot.py
 """
 import asyncio
+import base64
 import hashlib
+import html
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -15,13 +23,18 @@ import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler,
                           CommandHandler, ContextTypes, MessageHandler,
-                          PicklePersistence, filters)
+                          PicklePersistence, TypeHandler, filters)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 VT_API_KEY = os.environ["VT_API_KEY"]
 VT = "https://www.virustotal.com/api/v3"
 HEADERS = {"x-apikey": VT_API_KEY}
-MAX_BYTES = 20 * 1024 * 1024  # Telegram bots can download files up to 20 MB
+BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")  # optional local server
+MAX_MB = int(os.environ.get("MAX_FILE_MB", "20"))
+if not BOT_API_URL:
+    MAX_MB = min(MAX_MB, 20)  # Telegram's cloud Bot API only allows 20 MB
+MAX_BYTES = MAX_MB * 1024 * 1024
+ALERT_MIN = 3  # alert only when this many engines say "malicious"
 TG_LIMIT = 4000               # Telegram max message is 4096 characters
 DEFAULT_LANG = "en"
 
@@ -52,14 +65,15 @@ S = {
             "🦠 What kind of malware it is and what it does\n"
             "🛡️ What to do if you opened it\n"
             "🌐 IP addresses, domains and behaviour details\n\n"
-            "Limits: 20 MB max per file.\n"
+            "Limits: {max_mb} MB max per file.\n"
             "🔒 Privacy: scanned files are shared with VirusTotal, so don't send "
             "private documents.\n\n"
-            "Change language anytime with /language\n\n"
+            "🛡️ Auto Protection: add me to a group or connect me in Telegram Business and I will only speak up when a file is dangerous.\n\n"
+            "⚙️ Language and settings: /settings\n\n"
             "Go ahead, send me a file!"),
-        "hint": ("📎 Please send the file as a File: tap the paperclip, choose "
-                 "File, then pick it. Photos and text can't be scanned."),
-        "too_big": "File is too big (limit 20 MB).",
+        "hint": ("📎 Send me a file (paperclip → File) or a link and I'll scan "
+                 "it. Photos and plain text can't be scanned."),
+        "too_big": "File is too big (limit {max_mb} MB).",
         "scanning": "🔎 Scanning, please wait...",
         "collecting": "🧪 Threat found! Collecting IP, domain and behaviour details...",
         "error": "⚠️ Something went wrong while scanning. Please try again in a minute.",
@@ -127,6 +141,62 @@ S = {
         "beh_regs": "Registry keys it changed:",
         "beh_none": "No sandbox behaviour report is available for this file yet.",
         "det_title": "🔬 TOP ANTIVIRUS DETECTIONS",
+        "settings_text": (
+            "⚙️ Settings\n\n"
+            "🔒 Private chat settings\n"
+            "Check links and files that other people send you. Your own outgoing "
+            "messages, plain message text and ordinary photos are all ignored.\n\n"
+            "To turn this on, connect me in Telegram: Settings → Telegram "
+            "Business → Chatbots → add me."),
+        "set_lang_btn": "🌐 Language: English",
+        "set_files": "📁 Scan files",
+        "set_links": "🔗 Scan links",
+        "on": "ON ✅",
+        "off": "OFF ❌",
+        "l_danger": "🚨 DANGEROUS LINK: do not open it!",
+        "l_sus": "⚠️ SUSPICIOUS LINK: be careful.",
+        "l_clean": "✅ No threats found in this link.",
+        "l_url": "Link: {u}",
+        "l_flagged": "Flagged by {n}/{total} engines.",
+        "l_det": "Top detections:",
+        "l_advice": "Don't open it, and never enter a password or code on it.",
+        "l_clean_note": ("Not a guarantee. Check the address carefully before "
+                         "logging in anywhere."),
+        "l_error": "⚠️ Couldn't scan this link. Try again in a minute.",
+        "b_connected": ("✅ Connected to your private chats. I'll check links and "
+                        "files other people send you and message you the result "
+                        "here.\n\nChange this anytime in /settings"),
+        "b_disconnected": "Disconnected from your private chats.",
+        "b_from": "📨 Sent by {who}",
+        "r_level": "DANGER LEVEL: {lvl}",
+        "r_sus": "SUSPICIOUS FILE",
+        "r_clean": "CLEAN",
+        "r_type": "VIRUS TYPE",
+        "r_file": "FILE",
+        "r_det": "DETECTED BY",
+        "r_does": "WHAT IT CAN DO",
+        "r_ip": "IP ADDRESS",
+        "r_noip": "no IP data yet",
+        "r_opened": "IF YOU OPENED IT",
+        "r_tip": "TIP",
+        "short_opened": ("Disconnect from the internet → delete the file → change "
+                         "your passwords from another device → end all other "
+                         "Telegram sessions (Settings > Devices)."),
+        "short_tip": "Only open files from people you trust, and scan before opening.",
+        "btn_more": "📋 More info",
+        "full_title": "📋 FULL DETAILS",
+        "more_missing": "Those details are no longer available. Please send the file to me again.",
+        "upload_failed": ("⚠️ VirusTotal could not accept this file (it may be too "
+                          "large for the free plan). Try a smaller file."),
+        "a_file": "🔴 WARNING: THIS FILE IS NOT SAFE",
+        "a_do": "Do not open it.",
+        "set_deep": "🔬 Upload unknown files",
+        "g_settings_text": (
+            "⚙️ Group protection\n\n"
+            "I quietly check files and links shared in this group and only speak "
+            "up when something is dangerous.\n"
+            "Only group admins can change these settings."),
+        "admin_only": "Only group admins can change these settings.",
     },
     "km": {
         "choose_lang": "Choose your language / សូមជ្រើសរើសភាសា",
@@ -143,14 +213,15 @@ S = {
             "🦠 ប្រភេទមេរោគ និងអ្វីដែលវាធ្វើ\n"
             "🛡️ អ្វីដែលត្រូវធ្វើ ប្រសិនបើអ្នកបានបើកវា\n"
             "🌐 ព័ត៌មាន IP, domain និងឥរិយាបថ\n\n"
-            "កំណត់៖ ឯកសារអតិបរមា 20 MB។\n"
+            "កំណត់៖ ឯកសារអតិបរមា {max_mb} MB។\n"
             "🔒 ឯកជនភាព៖ ឯកសារដែលស្កេនត្រូវបានចែករំលែកជាមួយ VirusTotal "
             "ដូច្នេះសូមកុំផ្ញើឯកសារឯកជន។\n\n"
-            "ប្តូរភាសាបានគ្រប់ពេលដោយ /language\n\n"
+            "🛡️ ការការពារស្វ័យប្រវត្តិ៖ បន្ថែមខ្ញុំទៅក្នុងក្រុម ឬភ្ជាប់ខ្ញុំក្នុង Telegram Business ហើយខ្ញុំនឹងនិយាយតែពេលឯកសារមានគ្រោះថ្នាក់ប៉ុណ្ណោះ។\n\n"
+            "⚙️ ភាសា និងការកំណត់៖ /settings\n\n"
             "សូមផ្ញើឯកសារមកខ្ញុំបាន!"),
-        "hint": ("📎 សូមផ្ញើជា File៖ ចុចរូប 📎 ជ្រើសរើស File រួចជ្រើសឯកសារ។ "
-                 "រូបថត និងអក្សរមិនអាចស្កេនបានទេ។"),
-        "too_big": "ឯកសារធំពេក (កំណត់ត្រឹម 20 MB)។",
+        "hint": ("📎 សូមផ្ញើឯកសារ (ចុច 📎 → File) ឬតំណភ្ជាប់ ដើម្បីឱ្យខ្ញុំស្កេន។ "
+                 "រូបថត និងអក្សរធម្មតាមិនអាចស្កេនបានទេ។"),
+        "too_big": "ឯកសារធំពេក (កំណត់ត្រឹម {max_mb} MB)។",
         "scanning": "🔎 កំពុងស្កេន សូមរង់ចាំ...",
         "collecting": ("🧪 រកឃើញការគំរាមកំហែង! កំពុងប្រមូលព័ត៌មាន IP, domain "
                        "និងឥរិយាបថ..."),
@@ -220,6 +291,61 @@ S = {
         "beh_regs": "Registry keys ដែលវាបានកែប្រែ៖",
         "beh_none": "មិនទាន់មានរបាយការណ៍ឥរិយាបថពី sandbox សម្រាប់ឯកសារនេះទេ។",
         "det_title": "🔬 ការរកឃើញដោយកម្មវិធីកំចាត់មេរោគ (កំពូល)",
+        "settings_text": (
+            "⚙️ ការកំណត់\n\n"
+            "🔒 ការកំណត់ការជជែកឯកជន\n"
+            "ពិនិត្យតំណភ្ជាប់ និងឯកសារដែលអ្នកដទៃផ្ញើមកអ្នក។ សារដែលអ្នកផ្ញើខ្លួនឯង "
+            "អក្សរធម្មតា និងរូបថតធម្មតា នឹងត្រូវមិនអើពើទាំងអស់។\n\n"
+            "ដើម្បីបើកមុខងារនេះ សូមភ្ជាប់ខ្ញុំក្នុង Telegram៖ Settings → Telegram "
+            "Business → Chatbots → បន្ថែមខ្ញុំ។"),
+        "set_lang_btn": "🌐 ភាសា៖ ខ្មែរ",
+        "set_files": "📁 ស្កេនឯកសារ",
+        "set_links": "🔗 ស្កេនតំណភ្ជាប់",
+        "on": "បើក ✅",
+        "off": "បិទ ❌",
+        "l_danger": "🚨 តំណភ្ជាប់គ្រោះថ្នាក់៖ សូមកុំបើកវា!",
+        "l_sus": "⚠️ តំណភ្ជាប់គួរឱ្យសង្ស័យ៖ សូមប្រយ័ត្ន។",
+        "l_clean": "✅ រកមិនឃើញការគំរាមកំហែងក្នុងតំណភ្ជាប់នេះទេ។",
+        "l_url": "តំណភ្ជាប់៖ {u}",
+        "l_flagged": "រកឃើញដោយ {n}/{total} ម៉ាស៊ីនស្កេន។",
+        "l_det": "ការរកឃើញកំពូល៖",
+        "l_advice": "កុំបើកវា ហើយកុំបញ្ចូលពាក្យសម្ងាត់ ឬកូដណាមួយនៅលើវា។",
+        "l_clean_note": ("មិនមែនជាការធានាទេ។ សូមពិនិត្យអាសយដ្ឋានឱ្យបានល្អិតល្អន់មុន"
+                         "ចូលគណនីនៅកន្លែងណាមួយ។"),
+        "l_error": "⚠️ មិនអាចស្កេនតំណភ្ជាប់នេះបានទេ។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេលមួយនាទី។",
+        "b_connected": ("✅ បានភ្ជាប់ជាមួយការជជែកឯកជនរបស់អ្នក។ ខ្ញុំនឹងពិនិត្យតំណភ្ជាប់ "
+                        "និងឯកសារដែលអ្នកដទៃផ្ញើមកអ្នក ហើយផ្ញើលទ្ធផលមកទីនេះ។\n\n"
+                        "ប្តូរបានគ្រប់ពេលក្នុង /settings"),
+        "b_disconnected": "បានផ្តាច់ពីការជជែកឯកជនរបស់អ្នក។",
+        "b_from": "📨 ផ្ញើដោយ {who}",
+        "r_level": "កម្រិតគ្រោះថ្នាក់៖ {lvl}",
+        "r_sus": "ឯកសារគួរឱ្យសង្ស័យ",
+        "r_clean": "សុវត្ថិភាព",
+        "r_type": "ប្រភេទមេរោគ",
+        "r_file": "ឯកសារ",
+        "r_det": "រកឃើញដោយ",
+        "r_does": "អ្វីដែលវាអាចធ្វើបាន",
+        "r_ip": "អាសយដ្ឋាន IP",
+        "r_noip": "មិនទាន់មានទិន្នន័យ IP",
+        "r_opened": "ប្រសិនបើអ្នកបានបើកវា",
+        "r_tip": "ដំបូន្មាន",
+        "short_opened": ("កាត់ផ្តាច់អ៊ីនធឺណិត → លុបឯកសារ → ប្តូរពាក្យសម្ងាត់ពីឧបករណ៍ផ្សេង "
+                         "→ បញ្ចប់ session Telegram ផ្សេងទាំងអស់ (Settings > Devices)។"),
+        "short_tip": "បើកតែឯកសារពីមនុស្សដែលអ្នកទុកចិត្ត ហើយស្កេនមុនបើក។",
+        "btn_more": "📋 ព័ត៌មានបន្ថែម",
+        "full_title": "📋 ព័ត៌មានលម្អិតទាំងអស់",
+        "more_missing": "ព័ត៌មានទាំងនោះលែងមានទៀតហើយ។ សូមផ្ញើឯកសារមកខ្ញុំម្តងទៀត។",
+        "upload_failed": ("⚠️ VirusTotal មិនអាចទទួលឯកសារនេះបានទេ (វាអាចធំពេកសម្រាប់"
+                          "គម្រោងឥតគិតថ្លៃ)។ សូមសាកល្បងឯកសារតូចជាងនេះ។"),
+        "a_file": "🔴 ការព្រមាន៖ ឯកសារនេះមិនមានសុវត្ថិភាព",
+        "a_do": "សូមកុំបើកវា។",
+        "set_deep": "🔬 ផ្ទុកឡើងឯកសារមិនស្គាល់",
+        "g_settings_text": (
+            "⚙️ ការការពារក្រុម\n\n"
+            "ខ្ញុំពិនិត្យឯកសារ និងតំណភ្ជាប់ក្នុងក្រុមនេះដោយស្ងៀមស្ងាត់ "
+            "ហើយនិយាយតែពេលមានអ្វីគ្រោះថ្នាក់ប៉ុណ្ណោះ។\n"
+            "មានតែអ្នកគ្រប់គ្រង (admin) ក្រុមទេដែលអាចប្តូរការកំណត់នេះបាន។"),
+        "admin_only": "មានតែអ្នកគ្រប់គ្រង (admin) ក្រុមទេដែលអាចប្តូរការកំណត់នេះបាន។",
     },
 }
 
@@ -380,10 +506,28 @@ EXTRA_ADVICE = {
 
 def tr(lang: str, key: str, **kw) -> str:
     text = S.get(lang, S[DEFAULT_LANG])[key]
-    return text.format(**kw) if kw else text
+    return text.format(max_mb=MAX_MB, **kw)
 
 
 # ---------- helpers ----------
+LINE = "━━━━━━━━━━━━━━━"
+LEVEL_ICON = {"LOW": "🟡", "MEDIUM": "🟠", "HIGH": "🔴", "CRITICAL": "🔴"}
+LEVEL_NAME = {
+    "en": {"LOW": "LOW", "MEDIUM": "MEDIUM", "HIGH": "HIGH", "CRITICAL": "CRITICAL"},
+    "km": {"LOW": "ទាប", "MEDIUM": "មធ្យម", "HIGH": "ខ្ពស់", "CRITICAL": "ធ្ងន់ធ្ងរបំផុត"},
+}
+VT_SMALL_LIMIT = 32 * 1024 * 1024  # VirusTotal's normal upload limit
+CACHE_MAX = 300
+REPORT_CACHE = {}  # sha256 -> VirusTotal file report (used by "More info")
+UNIQUE_CACHE = {}  # Telegram file_unique_id -> sha256 (skip re-downloading)
+
+
+def cache_put(cache: dict, key, value):
+    if len(cache) >= CACHE_MAX:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
 def defang(text) -> str:
     """Make links/IPs unclickable so nobody opens them by accident."""
     return str(text).replace("http", "hxxp").replace(".", "[.]")
@@ -412,18 +556,37 @@ def sha256_of(path: str) -> str:
     return h.hexdigest()
 
 
-async def send_long(message, text: str):
-    """Telegram rejects messages over 4096 chars, so split long reports."""
+def first_sentence(text: str, lang: str) -> str:
+    sep = "។" if lang == "km" else ". "
+    i = text.find(sep)
+    return text if i == -1 else text[: i + len(sep)].strip()
+
+
+def sha_to_token(sha_hex: str) -> str:
+    """43-char token for a SHA-256 (fits Telegram's 64-byte button limits)."""
+    return base64.urlsafe_b64encode(bytes.fromhex(sha_hex)).decode().rstrip("=")
+
+
+def token_to_sha(token: str):
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    except Exception:
+        return None
+    return raw.hex() if len(raw) == 32 else None
+
+
+async def send_long(send, text: str):
+    """Send text via `send(chunk)`, splitting at Telegram's 4096-char limit."""
     while text:
         if len(text) <= TG_LIMIT:
-            await message.reply_text(text)
+            await send(text)
             return
         cut = text.rfind("\n\n", 0, TG_LIMIT)
         if cut <= 0:
             cut = text.rfind("\n", 0, TG_LIMIT)
         if cut <= 0:
             cut = TG_LIMIT
-        await message.reply_text(text[:cut])
+        await send(text[:cut])
         text = text[cut:].lstrip("\n")
 
 
@@ -444,11 +607,24 @@ async def vt_get(client: httpx.AsyncClient, path: str, retries: int = 2):
     return None
 
 
-async def vt_upload_and_wait(client: httpx.AsyncClient, path: str, sha: str):
-    with open(path, "rb") as f:
-        r = await client.post(f"{VT}/files", headers=HEADERS, files={"file": f})
-    r.raise_for_status()
-    for _ in range(12):  # poll up to ~2 minutes
+async def vt_upload(client: httpx.AsyncClient, path: str, size: int) -> bool:
+    url = f"{VT}/files"
+    if size > VT_SMALL_LIMIT:  # big files need a special upload URL
+        up = await vt_get(client, "/files/upload_url")
+        url = up.get("data") if isinstance(up, dict) else None
+        if not url:
+            return False
+    try:
+        with open(path, "rb") as f:
+            r = await client.post(url, headers=HEADERS, files={"file": f},
+                                  timeout=300)
+    except httpx.HTTPError:
+        return False
+    return r.status_code == 200
+
+
+async def vt_wait(client: httpx.AsyncClient, sha: str, tries: int = 12):
+    for _ in range(tries):  # ~2 minutes
         await asyncio.sleep(10)
         report = await vt_get(client, f"/files/{sha}", retries=0)
         if report and report["data"]["attributes"].get("last_analysis_results"):
@@ -456,8 +632,24 @@ async def vt_upload_and_wait(client: httpx.AsyncClient, path: str, sha: str):
     return None
 
 
-async def fetch_extras(client: httpx.AsyncClient, sha: str) -> dict:
-    """IPs, domains, URLs and sandbox behaviour (only fetched for flagged files)."""
+async def vt_file_report(client, path: str, sha: str, size: int, allow_upload: bool):
+    """Returns (report, status). Only uploads the file if allow_upload is True."""
+    report = await vt_get(client, f"/files/{sha}")
+    if report is not None:
+        return report, "ok"
+    if not allow_upload:
+        return None, "unknown"
+    if not await vt_upload(client, path, size):
+        return None, "upload_failed"
+    report = await vt_wait(client, sha)
+    return (report, "ok") if report else (None, "timeout")
+
+
+async def fetch_ips(client: httpx.AsyncClient, sha: str, n: int = 3) -> list:
+    return items(await vt_get(client, f"/files/{sha}/contacted_ips?limit={n}"))
+
+
+async def fetch_full_extras(client: httpx.AsyncClient, sha: str) -> dict:
     return {
         "ips": await vt_get(client, f"/files/{sha}/contacted_ips?limit=10"),
         "domains": await vt_get(client, f"/files/{sha}/contacted_domains?limit=10"),
@@ -466,30 +658,48 @@ async def fetch_extras(client: httpx.AsyncClient, sha: str) -> dict:
     }
 
 
-# ---------- report sections ----------
-def file_info(a: dict, lang: str) -> str:
+def url_id(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+
+
+async def vt_scan_url(client: httpx.AsyncClient, url: str):
+    uid = url_id(url)
+    rep = await vt_get(client, f"/urls/{uid}")  # already known?
+    if rep:
+        return rep["data"]["attributes"]
+    try:
+        r = await client.post(f"{VT}/urls", headers=HEADERS, data={"url": url})
+        if r.status_code == 429:
+            await asyncio.sleep(20)
+            r = await client.post(f"{VT}/urls", headers=HEADERS, data={"url": url})
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    for _ in range(8):  # wait up to ~1 minute
+        await asyncio.sleep(8)
+        rep = await vt_get(client, f"/urls/{uid}", retries=0)
+        if rep and rep["data"]["attributes"].get("last_analysis_results"):
+            return rep["data"]["attributes"]
+    return None
+
+
+async def get_url_attrs(url: str):
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            return await vt_scan_url(client, url)
+    except Exception as e:
+        print("Link scan error:", repr(e))
+        return None
+
+
+# ---------- report building ----------
+def file_name(a: dict, lang: str) -> str:
     names = a.get("names") or []
-    name = a.get("meaningful_name") or (names[0] if names else tr(lang, "unknown"))
-    votes = a.get("total_votes", {})
-    lines = [
-        tr(lang, "file_title"),
-        f"{tr(lang, 'f_name')}: {short(name, 60)}",
-        f"{tr(lang, 'f_type')}: {a.get('type_description', tr(lang, 'unknown'))}",
-        f"{tr(lang, 'f_size')}: {round(a.get('size', 0) / 1024, 1)} KB",
-        f"MD5: {a.get('md5', '?')}",
-        f"SHA-256: {a.get('sha256', '?')}",
-        f"{tr(lang, 'f_first')}: {fmt_date(a.get('first_submission_date'), lang)}",
-        f"{tr(lang, 'f_last')}: {fmt_date(a.get('last_analysis_date'), lang)}",
-        f"{tr(lang, 'f_times')}: {a.get('times_submitted', '?')}",
-        tr(lang, "f_votes", good=votes.get("harmless", 0),
-           bad=votes.get("malicious", 0)),
-    ]
-    if a.get("tags"):
-        lines.append(f"{tr(lang, 'f_tags')}: " + ", ".join(a["tags"][:8]))
-    return "\n".join(lines)
+    return a.get("meaningful_name") or (names[0] if names else tr(lang, "unknown"))
 
 
-def type_section(a: dict, bad: int, lang: str):
+def threat_info(a: dict, bad: int, lang: str) -> dict:
     cls = a.get("popular_threat_classification", {})
     label = cls.get("suggested_threat_label", "unknown")
     cats = [c["value"].lower() for c in cls.get("popular_threat_category", [])]
@@ -497,27 +707,97 @@ def type_section(a: dict, bad: int, lang: str):
     if not cats and label != "unknown":
         cats = [label.split(".")[0].split("/")[0].lower()]
 
-    type_name = " / ".join(c.upper() for c in cats) if cats \
-        else tr(lang, "type_unknown")
-    lines = [tr(lang, "type_title", t=type_name),
-             tr(lang, "detected_as", label=label)]
-    if families:
-        lines.append(tr(lang, "family", f=", ".join(families[:3])))
-
-    worst, explained = None, []
+    worst, best = None, None
     for c in cats:
         info = EXPLAIN.get(c)
-        if info:
-            explained.append(f"• {c.capitalize()}: {info[lang]}")
-            if worst is None or ORDER.index(info["level"]) > ORDER.index(worst):
-                worst = info["level"]
+        if info and (worst is None
+                     or ORDER.index(info["level"]) > ORDER.index(worst)):
+            worst, best = info["level"], c
     if worst is None:
         worst = "HIGH" if bad >= 10 else "MEDIUM"
 
-    lines.append("\n" + tr(lang, "danger_level", lvl=LEVELS[lang][worst]))
+    return {
+        "label": label,
+        "families": families,
+        "cats": cats,
+        "type_name": " / ".join(c.upper() for c in cats[:3]) if cats
+        else tr(lang, "type_unknown"),
+        "level": worst,
+        "what": first_sentence(EXPLAIN[best][lang], lang) if best
+        else tr(lang, "no_type"),
+        "explained": [f"• {c.capitalize()}: {EXPLAIN[c][lang]}"
+                      for c in cats if c in EXPLAIN],
+    }
+
+
+def build_short(a: dict, bad: int, sus: int, total: int, ips: list, lang: str) -> str:
+    """The short, professional report (Telegram HTML)."""
+    e = html.escape
+    name = e(short(file_name(a, lang), 40))
+    size = round(a.get("size", 0) / 1024, 1)
+    flagged = bad + sus
+
+    if flagged == 0:
+        return "\n".join([
+            f"<b>✅ {tr(lang, 'r_clean')}</b>", LINE,
+            f"<b>📄 {tr(lang, 'r_file')}:</b> {name} · {size} KB",
+            f"<b>🔎 {tr(lang, 'r_det')}:</b> 0/{total}", "",
+            e(tr(lang, "clean_note")), "", tr(lang, "thanks")])
+
+    info = threat_info(a, bad, lang)
+    if bad >= ALERT_MIN:
+        lvl = LEVEL_NAME[lang][info["level"]]
+        head = f"{LEVEL_ICON[info['level']]} {tr(lang, 'r_level', lvl=lvl)}"
+    else:
+        head = f"🟡 {tr(lang, 'r_sus')}"
+
+    lines = [
+        f"<b>{head}</b>", LINE,
+        f"<b>🦠 {tr(lang, 'r_type')}:</b> {e(info['type_name'])}",
+        f"<b>📄 {tr(lang, 'r_file')}:</b> {name} · {size} KB",
+        f"<b>🔎 {tr(lang, 'r_det')}:</b> {flagged}/{total}", "",
+        f"<b>💥 {tr(lang, 'r_does')}</b>", e(info["what"]), "",
+    ]
+    if ips:
+        lines.append(f"<b>🌐 {tr(lang, 'r_ip')}:</b>")
+        for i in ips[:3]:
+            country = i.get("attributes", {}).get("country", "?")
+            lines.append(f"<code>{e(defang(i.get('id', '?')))}</code> ({e(str(country))})")
+    else:
+        lines.append(f"<b>🌐 {tr(lang, 'r_ip')}:</b> {tr(lang, 'r_noip')}")
+    lines += [
+        "", f"<b>🛡️ {tr(lang, 'r_opened')}</b>", e(tr(lang, "short_opened")),
+        "", f"<b>✅ {tr(lang, 'r_tip')}</b>", e(tr(lang, "short_tip")),
+        "", tr(lang, "thanks"),
+    ]
+    return "\n".join(lines)
+
+
+def build_alert_file(a: dict, bad: int, lang: str, header: str = "") -> str:
+    """Very short alarm used by Auto Protection (Telegram HTML)."""
+    e = html.escape
+    info = threat_info(a, bad, lang)
+    lines = []
+    if header:
+        lines += [f"<b>{e(header)}</b>", ""]
+    lines += [
+        f"<b>{tr(lang, 'a_file')}</b>",
+        f"<b>🦠 {e(info['type_name'])}</b>: {e(info['what'])}",
+        tr(lang, "a_do"), "", tr(lang, "thanks"),
+    ]
+    return "\n".join(lines)
+
+
+def type_section(a: dict, bad: int, lang: str):
+    info = threat_info(a, bad, lang)
+    lines = [tr(lang, "type_title", t=info["type_name"]),
+             tr(lang, "detected_as", label=info["label"])]
+    if info["families"]:
+        lines.append(tr(lang, "family", f=", ".join(info["families"][:3])))
+    lines.append("\n" + tr(lang, "danger_level", lvl=LEVELS[lang][info["level"]]))
     lines.append("\n" + tr(lang, "what_title"))
-    lines.extend(explained if explained else [tr(lang, "no_type")])
-    return "\n".join(lines), cats
+    lines.extend(info["explained"] or [tr(lang, "no_type")])
+    return "\n".join(lines), info["cats"]
 
 
 def advice_section(cats: list, lang: str) -> str:
@@ -533,6 +813,26 @@ def advice_section(cats: list, lang: str) -> str:
     return "\n".join(lines)
 
 
+def file_info(a: dict, lang: str) -> str:
+    votes = a.get("total_votes", {})
+    lines = [
+        tr(lang, "file_title"),
+        f"{tr(lang, 'f_name')}: {short(file_name(a, lang), 60)}",
+        f"{tr(lang, 'f_type')}: {a.get('type_description', tr(lang, 'unknown'))}",
+        f"{tr(lang, 'f_size')}: {round(a.get('size', 0) / 1024, 1)} KB",
+        f"MD5: {a.get('md5', '?')}",
+        f"SHA-256: {a.get('sha256', '?')}",
+        f"{tr(lang, 'f_first')}: {fmt_date(a.get('first_submission_date'), lang)}",
+        f"{tr(lang, 'f_last')}: {fmt_date(a.get('last_analysis_date'), lang)}",
+        f"{tr(lang, 'f_times')}: {a.get('times_submitted', '?')}",
+        tr(lang, "f_votes", good=votes.get("harmless", 0),
+           bad=votes.get("malicious", 0)),
+    ]
+    if a.get("tags"):
+        lines.append(f"{tr(lang, 'f_tags')}: " + ", ".join(a["tags"][:8]))
+    return "\n".join(lines)
+
+
 def network_section(extras: dict, lang: str) -> str:
     lines = [tr(lang, "net_title")]
     found = False
@@ -544,8 +844,7 @@ def network_section(extras: dict, lang: str) -> str:
         for i in ips[:10]:
             at = i.get("attributes", {})
             flagged = at.get("last_analysis_stats", {}).get("malicious", 0)
-            lines.append(f"• {defang(i.get('id', '?'))} | "
-                         f"{at.get('country', '?')} | "
+            lines.append(f"• {defang(i.get('id', '?'))} | {at.get('country', '?')} | "
                          f"{short(at.get('as_owner', '?'), 40)} | "
                          f"{tr(lang, 'net_flagged', n=flagged)}")
 
@@ -577,8 +876,7 @@ def behaviour_section(extras: dict, a: dict, lang: str) -> str:
     lines = [tr(lang, "beh_title")]
     found = False
 
-    sv = a.get("sandbox_verdicts") or {}
-    for sandbox, v in list(sv.items())[:3]:
+    for sandbox, v in list((a.get("sandbox_verdicts") or {}).items())[:3]:
         found = True
         names = ", ".join((v.get("malware_names") or [])[:3])
         lines.append(f"• {sandbox}: {v.get('category', '?')}"
@@ -588,7 +886,6 @@ def behaviour_section(extras: dict, a: dict, lang: str) -> str:
         if b.get("tags"):
             found = True
             lines.append(f"{tr(lang, 'beh_tags')}: " + ", ".join(b["tags"][:8]))
-
         mitre = b.get("mitre_attack_techniques") or []
         if mitre:
             found = True
@@ -596,21 +893,17 @@ def behaviour_section(extras: dict, a: dict, lang: str) -> str:
             for t in mitre[:6]:
                 sev = str(t.get("severity", "")).replace("IMPACT_SEVERITY_", "")
                 lines.append(f"• {t.get('id', '?')}: "
-                             f"{short(t.get('signature_description', ''), 80)} "
-                             f"({sev})")
-
+                             f"{short(t.get('signature_description', ''), 80)} ({sev})")
         cmds = b.get("command_executions") or []
         if cmds:
             found = True
             lines.append("\n" + tr(lang, "beh_cmds"))
             lines.extend(f"• {short(c, 100)}" for c in cmds[:3])
-
         written = b.get("files_written") or []
         if written:
             found = True
             lines.append("\n" + tr(lang, "beh_files"))
             lines.extend(f"• {short(w, 100)}" for w in written[:5])
-
         regs = b.get("registry_keys_set") or []
         if regs:
             found = True
@@ -628,13 +921,11 @@ def detections_section(a: dict, lang: str) -> str:
     results = a.get("last_analysis_results", {})
     hits = [f"• {eng}: {short(r['result'], 50)}" for eng, r in results.items()
             if r.get("category") == "malicious" and r.get("result")]
-    if not hits:
-        return ""
-    return tr(lang, "det_title") + "\n" + "\n".join(hits[:8])
+    return (tr(lang, "det_title") + "\n" + "\n".join(hits[:10])) if hits else ""
 
 
-def build_report(data: dict, extras: dict, lang: str = DEFAULT_LANG) -> str:
-    a = data["data"]["attributes"]
+def build_full(a: dict, extras: dict, lang: str) -> str:
+    """Everything VirusTotal knows (plain text). Shown by the More info button."""
     stats = a.get("last_analysis_stats", {})
     bad = stats.get("malicious", 0)
     sus = stats.get("suspicious", 0)
@@ -642,54 +933,211 @@ def build_report(data: dict, extras: dict, lang: str = DEFAULT_LANG) -> str:
     flagged = bad + sus
 
     if flagged == 0:
-        return "\n\n".join([
-            tr(lang, "v_clean", total=total),
-            file_info(a, lang),
-            tr(lang, "clean_note"),
-            tr(lang, "thanks"),
-        ])
-
-    if bad >= 10:
-        verdict = tr(lang, "v_danger")
-    elif bad >= 3:
-        verdict = tr(lang, "v_likely")
+        verdict = tr(lang, "v_clean", total=total)
     else:
-        verdict = tr(lang, "v_sus")
+        key = "v_danger" if bad >= 10 else "v_likely" if bad >= 3 else "v_sus"
+        verdict = f"{tr(lang, key)}\n{tr(lang, 'flagged_by', n=flagged, total=total)}"
 
-    types_text, cats = type_section(a, bad, lang)
-    parts = [
-        f"{verdict}\n{tr(lang, 'flagged_by', n=flagged, total=total)}",
-        types_text,
-        advice_section(cats, lang),
-        file_info(a, lang),
-        network_section(extras, lang),
-        behaviour_section(extras, a, lang),
-        detections_section(a, lang),
-        tr(lang, "thanks"),
-    ]
+    parts = [tr(lang, "full_title"), verdict]
+    if flagged:
+        types_text, cats = type_section(a, bad, lang)
+        parts += [types_text, advice_section(cats, lang)]
+    parts += [file_info(a, lang), network_section(extras, lang),
+              behaviour_section(extras, a, lang), detections_section(a, lang),
+              tr(lang, "thanks")]
     return "\n\n".join(p for p in parts if p)
 
 
+def build_link_report(attrs: dict, url: str, lang: str) -> str:
+    stats = attrs.get("last_analysis_stats", {})
+    bad = stats.get("malicious", 0)
+    sus = stats.get("suspicious", 0)
+    total = sum(stats.values())
+    flagged = bad + sus
+
+    if bad >= ALERT_MIN:
+        verdict = tr(lang, "l_danger")
+    elif flagged >= 1:
+        verdict = tr(lang, "l_sus")
+    else:
+        verdict = tr(lang, "l_clean")
+
+    lines = [verdict, tr(lang, "l_url", u=short(defang(url), 80))]
+    if flagged:
+        lines.append(tr(lang, "l_flagged", n=flagged, total=total))
+        results = attrs.get("last_analysis_results", {})
+        hits = [f"• {eng}: {short(r['result'], 30)}" for eng, r in results.items()
+                if r.get("category") in ("malicious", "suspicious")
+                and r.get("result")]
+        if hits:
+            lines.append(tr(lang, "l_det"))
+            lines.extend(hits[:3])
+        lines.append(tr(lang, "l_advice"))
+    else:
+        lines.append(tr(lang, "l_clean_note"))
+    lines.append(tr(lang, "thanks"))
+    return "\n".join(lines)
+
+
+def extract_urls(message) -> list:
+    """Links in a message's text or caption (max 3, http/https only)."""
+    found = []
+    for e in message.entities or []:
+        if e.type == "url":
+            found.append(message.parse_entity(e))
+        elif e.type == "text_link" and e.url:
+            found.append(e.url)
+    for e in message.caption_entities or []:
+        if e.type == "url":
+            found.append(message.parse_caption_entity(e))
+        elif e.type == "text_link" and e.url:
+            found.append(e.url)
+    urls = []
+    for u in found:
+        if "://" not in u:
+            u = "http://" + u
+        if u.lower().startswith(("http://", "https://")) and u not in urls:
+            urls.append(u)
+    return urls[:3]
+
+
+# ---------- scanning ----------
+async def download_and_hash(bot, doc, path: str) -> str:
+    tg_file = await bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(path)
+    return sha256_of(path)
+
+
+async def scan_link(url: str, lang: str) -> str:
+    attrs = await get_url_attrs(url)
+    return tr(lang, "l_error") if attrs is None else build_link_report(attrs, url, lang)
+
+
+async def full_report_for(sha: str, lang: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            report = REPORT_CACHE.get(sha) or await vt_get(client, f"/files/{sha}")
+            if not report:
+                return tr(lang, "more_missing")
+            extras = await fetch_full_extras(client, sha)
+    except Exception as e:
+        print("Full report error:", repr(e))
+        return tr(lang, "error")
+    return build_full(report["data"]["attributes"], extras, lang)
+
+
+async def auto_check_file(bot, doc, store: dict):
+    """Quiet background check. Returns the VirusTotal report or None.
+    Unknown files are NOT uploaded unless the 'deep' setting is on."""
+    if doc.file_size and doc.file_size > MAX_BYTES:
+        return None
+    sha = UNIQUE_CACHE.get(doc.file_unique_id)
+    if sha and sha in REPORT_CACHE:
+        return REPORT_CACHE[sha]
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "sample.bin")  # never executed or opened
+                sha = await download_and_hash(bot, doc, path)
+                cache_put(UNIQUE_CACHE, doc.file_unique_id, sha)
+                report, _ = await vt_file_report(
+                    client, path, sha, os.path.getsize(path),
+                    allow_upload=store.get("deep", False))
+    except Exception as e:
+        print("Auto scan error:", repr(e))
+        return None
+    if report:
+        cache_put(REPORT_CACHE, sha, report)
+    return report
+
+
+def report_numbers(report: dict):
+    a = report["data"]["attributes"]
+    st = a.get("last_analysis_stats", {})
+    sha = report["data"].get("id") or a.get("sha256")
+    return a, st.get("malicious", 0), st.get("suspicious", 0), sum(st.values()), sha
+
+
+def more_button(lang: str, sha: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        tr(lang, "btn_more"), callback_data="more:" + sha_to_token(sha))]])
+
+
 # ---------- Telegram handlers ----------
-def get_lang(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.user_data.get("lang", DEFAULT_LANG)
+def is_group(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type in ("group", "supergroup"))
 
 
-def lang_keyboard() -> InlineKeyboardMarkup:
+def store_for(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Groups keep settings per group; private chats keep them per user."""
+    return context.chat_data if is_group(update) else context.user_data
+
+
+def get_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    return store_for(update, context).get("lang", DEFAULT_LANG)
+
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not is_group(update):
+        return True
+    user = update.effective_user
+    if user is None:
+        return False
+    try:
+        m = await context.bot.get_chat_member(update.effective_chat.id, user.id)
+    except Exception:
+        return False
+    return m.status in ("administrator", "creator")
+
+
+def lang_keyboard(prefix: str = "lang") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🇬🇧 English", callback_data="lang:en"),
-        InlineKeyboardButton("🇰🇭 ខ្មែរ", callback_data="lang:km"),
+        InlineKeyboardButton("🇬🇧 English", callback_data=f"{prefix}:en"),
+        InlineKeyboardButton("🇰🇭 ខ្មែរ", callback_data=f"{prefix}:km"),
     ]])
 
 
+def settings_view(store: dict, group: bool = False):
+    lang = store.get("lang", DEFAULT_LANG)
+
+    def state(key, default=True):
+        return tr(lang, "on" if store.get(key, default) else "off")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(tr(lang, "set_lang_btn"), callback_data="set:lang")],
+        [InlineKeyboardButton(f"{tr(lang, 'set_files')}: {state('auto_files')}",
+                              callback_data="set:files")],
+        [InlineKeyboardButton(f"{tr(lang, 'set_links')}: {state('auto_links')}",
+                              callback_data="set:links")],
+        [InlineKeyboardButton(f"{tr(lang, 'set_deep')}: {state('deep', False)}",
+                              callback_data="set:deep")],
+    ])
+    return tr(lang, "g_settings_text" if group else "settings_text"), kb
+
+
 async def ask_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group(update):
+        await settings_cmd(update, context)
+        return
     await update.message.reply_text(S["en"]["choose_lang"],
                                     reply_markup=lang_keyboard())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "lang" in context.user_data:
-        await update.message.reply_text(tr(get_lang(context), "welcome"))
+    store = store_for(update, context)
+    lang = store.get("lang", DEFAULT_LANG)
+
+    args = context.args or []
+    if args and args[0].startswith("r_"):  # "More info" link from a group alert
+        sha = token_to_sha(args[0][2:])
+        if sha:
+            await update.message.reply_text(tr(lang, "scanning"))
+            await send_long(update.message.reply_text, await full_report_for(sha, lang))
+            return
+
+    if is_group(update) or "lang" in store:
+        await update.message.reply_text(tr(lang, "welcome"))
     else:
         await ask_language(update, context)
 
@@ -705,63 +1153,258 @@ async def on_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(tr(lang, "welcome"))
 
 
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store = store_for(update, context)
+    if not await is_admin(update, context):
+        await update.message.reply_text(tr(store.get("lang", DEFAULT_LANG), "admin_only"))
+        return
+    text, kb = settings_view(store, is_group(update))
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store = store_for(update, context)
+    if not await is_admin(update, context):
+        await query.answer(tr(store.get("lang", DEFAULT_LANG), "admin_only"),
+                           show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "lang":
+        await query.edit_message_text(S["en"]["choose_lang"],
+                                      reply_markup=lang_keyboard("setlang"))
+        return
+    if action == "files":
+        store["auto_files"] = not store.get("auto_files", True)
+    elif action == "links":
+        store["auto_links"] = not store.get("auto_links", True)
+    elif action == "deep":
+        store["deep"] = not store.get("deep", False)
+    text, kb = settings_view(store, is_group(update))
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def on_setlang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store = store_for(update, context)
+    if not await is_admin(update, context):
+        await query.answer(tr(store.get("lang", DEFAULT_LANG), "admin_only"),
+                           show_alert=True)
+        return
+    await query.answer()
+    lang = query.data.split(":", 1)[1]
+    if lang in S:
+        store["lang"] = lang
+    text, kb = settings_view(store, is_group(update))
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+async def on_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'More info' button: send everything VirusTotal knows about the file."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_lang(update, context)
+    sha = token_to_sha(query.data.split(":", 1)[1])
+    if not sha:
+        return
+    await query.message.reply_text(tr(lang, "scanning"))
+    await send_long(query.message.reply_text, await full_report_for(sha, lang))
+
+
 async def hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(tr(get_lang(context), "hint"))
+    await update.message.reply_text(tr(get_lang(update, context), "hint"))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context)
+    """A person sends a file straight to the bot: full scan with short report."""
+    lang = get_lang(update, context)
     doc = update.message.document
     if doc.file_size and doc.file_size > MAX_BYTES:
         await update.message.reply_text(tr(lang, "too_big"))
         return
 
     await update.message.reply_text(tr(lang, "scanning"))
+    report, status, ips = None, "ok", []
     try:
-        tg_file = await context.bot.get_file(doc.file_id)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "sample.bin")  # never executed or opened
-            await tg_file.download_to_drive(path)
-            sha = sha256_of(path)
-
+            sha = await download_and_hash(context.bot, doc, path)
             async with httpx.AsyncClient(timeout=60) as client:
-                report = await vt_get(client, f"/files/{sha}")  # known file?
-                if report is None:
-                    report = await vt_upload_and_wait(client, path, sha)
-
-                extras = {}
-                if report is not None:
-                    st = report["data"]["attributes"].get("last_analysis_stats", {})
-                    if st.get("malicious", 0) + st.get("suspicious", 0) > 0:
-                        await update.message.reply_text(tr(lang, "collecting"))
-                        extras = await fetch_extras(client, sha)
-    except Exception as e:  # keep the bot alive on any failure
+                report, status = await vt_file_report(
+                    client, path, sha, os.path.getsize(path), allow_upload=True)
+                if report:
+                    _, bad, sus, _, _ = report_numbers(report)
+                    if bad + sus > 0:
+                        ips = await fetch_ips(client, sha)
+    except Exception as e:
         print("Scan error:", repr(e))
         await update.message.reply_text(tr(lang, "error"))
         return
 
     if report is None:
-        await update.message.reply_text(tr(lang, "timeout"))
+        await update.message.reply_text(
+            tr(lang, "upload_failed" if status == "upload_failed" else "timeout"))
         return
 
-    await send_long(update.message, build_report(report, extras, lang))
+    cache_put(REPORT_CACHE, sha, report)
+    a, bad, sus, total, _ = report_numbers(report)
+    await update.message.reply_text(
+        build_short(a, bad, sus, total, ips, lang),
+        parse_mode="HTML", reply_markup=more_button(lang, sha))
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_lang(update, context)
+    urls = extract_urls(update.message)
+    if not urls:
+        await update.message.reply_text(tr(lang, "hint"))
+        return
+    await update.message.reply_text(tr(lang, "scanning"))
+    for u in urls:
+        await send_long(update.message.reply_text, await scan_link(u, lang))
+
+
+# ---------- Auto Protection: groups ----------
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quietly check files and links in a group. Speak up only if dangerous."""
+    msg = update.effective_message
+    if msg is None or (msg.from_user and msg.from_user.is_bot):
+        return
+    cd = context.chat_data
+    lang = cd.get("lang", DEFAULT_LANG)
+
+    try:
+        if msg.document and cd.get("auto_files", True):
+            report = await auto_check_file(context.bot, msg.document, cd)
+            if report:
+                a, bad, _, _, sha = report_numbers(report)
+                if bad >= ALERT_MIN:
+                    link = f"https://t.me/{context.bot.username}?start=r_{sha_to_token(sha)}"
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                        tr(lang, "btn_more"), url=link)]])
+                    await msg.reply_text(build_alert_file(a, bad, lang),
+                                         parse_mode="HTML", reply_markup=kb)
+
+        if cd.get("auto_links", True):
+            for u in extract_urls(msg):
+                attrs = await get_url_attrs(u)
+                if attrs and attrs.get("last_analysis_stats", {}).get(
+                        "malicious", 0) >= ALERT_MIN:
+                    await msg.reply_text(build_link_report(attrs, u, lang))
+    except Exception as e:
+        print("Group handler error:", repr(e))
+
+
+# ---------- Auto Protection: Telegram Business chats ----------
+async def get_connection(context: ContextTypes.DEFAULT_TYPE, bc_id: str) -> dict:
+    cache = context.bot_data.setdefault("bc", {})
+    if bc_id not in cache:
+        conn = await context.bot.get_business_connection(bc_id)
+        cache[bc_id] = {"owner_id": conn.user.id, "chat_id": conn.user_chat_id}
+    return cache[bc_id]
+
+
+async def tell_owner(context, chat_id: int, text: str, kb=None, html_mode=False):
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode="HTML" if html_mode else None, reply_markup=kb)
+    except Exception as e:
+        print("Could not message owner:", repr(e))
+
+
+async def on_business_connection(conn, context: ContextTypes.DEFAULT_TYPE):
+    cache = context.bot_data.setdefault("bc", {})
+    lang = context.application.user_data[conn.user.id].get("lang", DEFAULT_LANG)
+    if conn.is_enabled:
+        cache[conn.id] = {"owner_id": conn.user.id, "chat_id": conn.user_chat_id}
+        text = tr(lang, "b_connected")
+    else:
+        cache.pop(conn.id, None)
+        text = tr(lang, "b_disconnected")
+    await tell_owner(context, conn.user_chat_id, text)
+
+
+async def on_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = getattr(update, "business_connection", None)
+    if conn is not None:
+        await on_business_connection(conn, context)
+        return
+
+    msg = getattr(update, "business_message", None)
+    if msg is None:
+        return
+    try:
+        info = await get_connection(context, msg.business_connection_id)
+    except Exception as e:
+        print("Business connection error:", repr(e))
+        return
+
+    sender = msg.from_user
+    # Ignore the owner's own outgoing messages and bots.
+    if sender is None or sender.is_bot or sender.id == info["owner_id"]:
+        return
+
+    ud = context.application.user_data[info["owner_id"]]
+    lang = ud.get("lang", DEFAULT_LANG)
+    who = sender.full_name + (f" (@{sender.username})" if sender.username else "")
+    header = tr(lang, "b_from", who=who)
+
+    # Only files and links are checked. Plain text and photos are ignored.
+    # Safe items stay silent; only dangerous ones are reported, privately to you.
+    if msg.document and ud.get("auto_files", True):
+        report = await auto_check_file(context.bot, msg.document, ud)
+        if report:
+            a, bad, _, _, sha = report_numbers(report)
+            if bad >= ALERT_MIN:
+                await tell_owner(context, info["chat_id"],
+                                 build_alert_file(a, bad, lang, header),
+                                 kb=more_button(lang, sha), html_mode=True)
+
+    if ud.get("auto_links", True):
+        for u in extract_urls(msg):
+            attrs = await get_url_attrs(u)
+            if attrs and attrs.get("last_analysis_stats", {}).get(
+                    "malicious", 0) >= ALERT_MIN:
+                await tell_owner(context, info["chat_id"],
+                                 f"{header}\n\n{build_link_report(attrs, u, lang)}")
 
 
 def main():
-    # PicklePersistence remembers each user's language between restarts
-    # (it resets if the host wipes its disk on redeploy).
+    # PicklePersistence remembers each user's and group's settings between
+    # restarts (it resets if the host wipes its disk on redeploy).
     persistence = PicklePersistence(filepath="bot_data.pkl")
-    app = (ApplicationBuilder().token(TELEGRAM_TOKEN)
-           .persistence(persistence).build())
+    builder = (ApplicationBuilder().token(TELEGRAM_TOKEN)
+               .persistence(persistence)
+               .concurrent_updates(True))  # a slow scan must not block others
+    if BOT_API_URL:  # self-hosted Bot API server => files bigger than 20 MB
+        builder = (builder.base_url(f"{BOT_API_URL}/bot")
+                   .base_file_url(f"{BOT_API_URL}/file/bot")
+                   .local_mode(True))
+    app = builder.build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("language", ask_language))
+    app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CallbackQueryHandler(on_language, pattern=r"^lang:"))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(CallbackQueryHandler(on_settings, pattern=r"^set:"))
+    app.add_handler(CallbackQueryHandler(on_setlang, pattern=r"^setlang:"))
+    app.add_handler(CallbackQueryHandler(on_more, pattern=r"^more:"))
+
+    private = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+    app.add_handler(MessageHandler(filters.Document.ALL & private, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private,
+                                   handle_text))
     app.add_handler(MessageHandler(
-        filters.PHOTO | filters.VIDEO | filters.AUDIO
-        | (filters.TEXT & ~filters.COMMAND), hint))
-    app.run_polling()
+        (filters.PHOTO | filters.VIDEO | filters.AUDIO) & private, hint))
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & ~filters.COMMAND & filters.UpdateType.MESSAGE,
+        on_group_message))
+    # Business updates (chats you connected) are handled here.
+    app.add_handler(TypeHandler(Update, on_business_update), group=1)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
